@@ -204,6 +204,13 @@ from ..module_utils.constants import (
     NAMESPACES_WEB_ENDPOINT, NAMESPACE_CASCADE_DELETE_ENDPOINT
 )
 
+# Define allowed empty keys that have semantic meaning when explicitly set by user
+ALLOWED_EMPTY_KEYS = {
+    'metadata.labels',
+    'metadata.annotations',
+    'spec'
+}
+
 
 class Parameters(AnsibleF5Parameters):
     updatables = ['metadata', 'spec']
@@ -227,6 +234,35 @@ class Parameters(AnsibleF5Parameters):
 
 
 class ModuleParameters(Parameters):
+    def _extract_user_specified_empty_keys(self, obj, current_path=""):
+        """Extract paths to empty dicts that user explicitly specified"""
+        user_specified_keys = set()
+        
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_path = f"{current_path}.{key}" if current_path else key
+                
+                if isinstance(value, dict):
+                    if len(value) == 0:
+                        # This is an empty dict - check if it's in our allowed list
+                        if new_path in ALLOWED_EMPTY_KEYS:
+                            user_specified_keys.add(new_path)
+                    else:
+                        # Recursively check nested dictionaries
+                        user_specified_keys.update(
+                            self._extract_user_specified_empty_keys(value, new_path)
+                        )
+                elif isinstance(value, list):
+                    # Handle lists (though less common for empty key scenarios)
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict):
+                            item_path = f"{new_path}[{i}]"
+                            user_specified_keys.update(
+                                self._extract_user_specified_empty_keys(item, item_path)
+                            )
+        
+        return user_specified_keys
+
     @property
     def state(self):
         return self._values.get('state', 'present')
@@ -434,13 +470,38 @@ class Changes(Parameters):
             
         return False
 
-    @staticmethod
-    def _prune_none(data):
+    def _prune_none(self, data, user_specified_keys=None, current_path=""):
         """Recursively remove None values from nested dictionaries and lists."""
+        if user_specified_keys is None:
+            user_specified_keys = set()
+            
         if isinstance(data, dict):
-            return {k: Changes._prune_none(v) for k, v in data.items() if v is not None}
+            new_obj = {}
+            for k, v in data.items():
+                if v is None:
+                    continue
+                    
+                new_path = f"{current_path}.{k}" if current_path else k
+                pruned = self._prune_none(v, user_specified_keys, new_path)
+                
+                # Keep empty objects {} only if user explicitly specified them
+                if isinstance(pruned, dict) and len(pruned) == 0:
+                    if new_path in user_specified_keys:
+                        new_obj[k] = pruned
+                    # Otherwise skip the empty dict
+                elif pruned is None:
+                    continue
+                else:
+                    new_obj[k] = pruned
+            return new_obj
         elif isinstance(data, list):
-            return [Changes._prune_none(item) for item in data if item is not None]
+            new_list = []
+            for i, v in enumerate(data):
+                item_path = f"{current_path}[{i}]" if current_path else f"[{i}]"
+                pruned = self._prune_none(v, user_specified_keys, item_path)
+                if pruned is not None:
+                    new_list.append(pruned)
+            return new_list
         else:
             return data
 
@@ -452,7 +513,11 @@ class Changes(Parameters):
                 if value is not None:
                     result[returnable] = value
             result = self._filter_params(result)
-            result = self._prune_none(result)
+            
+            # Extract user-specified empty keys for enhanced pruning
+            temp_module = ModuleParameters({'metadata': result.get('metadata', {}), 'spec': result.get('spec', {})})
+            user_specified_keys = temp_module._extract_user_specified_empty_keys(result)
+            result = self._prune_none(result, user_specified_keys)
         except Exception:
             raise
         return result
@@ -465,7 +530,11 @@ class Changes(Parameters):
                 if value is not None:
                     result[updatable] = value
             result = self._filter_params(result)
-            result = self._prune_none(result)
+            
+            # Extract user-specified empty keys for enhanced pruning
+            temp_module = ModuleParameters({'metadata': result.get('metadata', {}), 'spec': result.get('spec', {})})
+            user_specified_keys = temp_module._extract_user_specified_empty_keys(result)
+            result = self._prune_none(result, user_specified_keys)
         except Exception:
             raise
         return result

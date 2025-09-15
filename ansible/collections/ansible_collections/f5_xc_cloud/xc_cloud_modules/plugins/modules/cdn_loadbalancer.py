@@ -195,11 +195,32 @@ class ModuleParameters(Parameters):
         cached = self._values.get('_normalized_spec')
         if cached is not None:
             return cached
-        normalized = self._prune_none(spec)
+        
+        # Extract user-specified empty keys from the original spec before pruning
+        user_specified_keys = self._extract_user_specified_empty_keys(spec)
+        normalized = self._prune_none(spec, user_specified_keys=user_specified_keys)
         # Validate and normalize CDN LB specific configurations
         normalized = self._validate_and_normalize_spec(normalized)
         self._values['_normalized_spec'] = normalized
         return normalized
+
+    def _extract_user_specified_empty_keys(self, obj, path="", keys=None):
+        """Extract keys that user explicitly specified as empty dicts using dot notation."""
+        if keys is None:
+            keys = set()
+        
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                current_path = f"{path}.{k}" if path else k
+                if v == {}:
+                    # Store both the simple key name and the full dot-notation path
+                    keys.add(k)
+                    if path:  # Only add dot notation if there's a parent path
+                        keys.add(current_path)
+                elif isinstance(v, dict):
+                    self._extract_user_specified_empty_keys(v, current_path, keys)
+        
+        return keys
 
     def _validate_and_normalize_spec(self, spec):
         """Validate and normalize CDN Load Balancer specific configurations."""
@@ -275,20 +296,28 @@ class ModuleParameters(Parameters):
         return spec
 
     @staticmethod
-    def _prune_none(obj, parent_key=None):
+    def _prune_none(obj, parent_key=None, user_specified_keys=None, current_path=""):
         if isinstance(obj, dict):
             new_obj = {}
             for k, v in obj.items():
                 if v is None:
                     continue
-                pruned = ModuleParameters._prune_none(v, k)
-                # Keep empty dicts for sentinel keys
-                if pruned in (None, {}, []) and k not in ModuleParameters.ALLOWED_EMPTY_KEYS:
+                
+                # Build the current path for this key
+                key_path = f"{current_path}.{k}" if current_path else k
+                
+                pruned = ModuleParameters._prune_none(v, k, user_specified_keys, key_path)
+                # Keep empty dicts only for keys that were explicitly specified by the user
+                if pruned in (None, {}, []):
+                    # Check if this key was specified by the user (either simple name or full path)
+                    if (user_specified_keys is not None and 
+                        (k in user_specified_keys or key_path in user_specified_keys)):
+                        new_obj[k] = pruned
                     continue
                 new_obj[k] = pruned
             return new_obj
         if isinstance(obj, list):
-            new_list = [ModuleParameters._prune_none(v, parent_key) for v in obj]
+            new_list = [ModuleParameters._prune_none(v, parent_key, user_specified_keys, current_path) for v in obj]
             return [v for v in new_list if v not in (None, {}, [])]
         return obj
 
@@ -309,7 +338,8 @@ class ApiParameters(Parameters):
         if spec is None:
             return spec
         # Apply same pruning as ModuleParameters for consistent comparison
-        return ModuleParameters._prune_none(spec)
+        # For API parameters, we don't have user context, so preserve all ALLOWED_EMPTY_KEYS
+        return ModuleParameters._prune_none(spec, user_specified_keys=ModuleParameters.ALLOWED_EMPTY_KEYS)
 
 
 class Changes(Parameters):
@@ -355,9 +385,9 @@ class Changes(Parameters):
             
             # Normalize both values using the same pruning logic
             if want_value is not None:
-                want_value = ModuleParameters._prune_none(want_value)
+                want_value = ModuleParameters._prune_none(want_value, user_specified_keys=ModuleParameters.ALLOWED_EMPTY_KEYS)
             if have_value is not None:
-                have_value = ModuleParameters._prune_none(have_value)
+                have_value = ModuleParameters._prune_none(have_value, user_specified_keys=ModuleParameters.ALLOWED_EMPTY_KEYS)
             
             if self._values_differ(want_value, have_value):
                 self._changed_params.add(param)
@@ -559,9 +589,9 @@ class ModuleManager(object):
     def _normalize_existing(self, data):
         # Prune None values similar to desired normalization
         normalized = deepcopy(data)
-        normalized['metadata'] = ModuleParameters._prune_none(normalized.get('metadata', {}))
+        normalized['metadata'] = ModuleParameters._prune_none(normalized.get('metadata', {}), user_specified_keys=ModuleParameters.ALLOWED_EMPTY_KEYS)
         if 'spec' in normalized:
-            normalized['spec'] = ModuleParameters._prune_none(normalized['spec'])
+            normalized['spec'] = ModuleParameters._prune_none(normalized['spec'], user_specified_keys=ModuleParameters.ALLOWED_EMPTY_KEYS)
         return normalized
 
     def create(self):

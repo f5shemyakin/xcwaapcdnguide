@@ -166,6 +166,19 @@ from ..module_utils.common import (
 )
 from copy import deepcopy
 
+# Define allowed empty keys that have semantic meaning when explicitly set by user
+ALLOWED_EMPTY_KEYS = {
+    # Metadata options
+    'metadata.annotations',
+    'metadata.labels',
+    
+    # HTTP health check options
+    'http_health_check.headers',
+    'http_health_check.use_origin_server_name',
+    
+    # Future expansion for other health check types
+}
+
 
 class Parameters(AnsibleF5Parameters):
     updatables = ['metadata', 'spec']
@@ -188,6 +201,35 @@ class Parameters(AnsibleF5Parameters):
 
 
 class ModuleParameters(Parameters):
+    def _extract_user_specified_empty_keys(self, obj, current_path=""):
+        """Extract paths to empty dicts that user explicitly specified"""
+        user_specified_keys = set()
+        
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_path = f"{current_path}.{key}" if current_path else key
+                
+                if isinstance(value, dict):
+                    if len(value) == 0:
+                        # This is an empty dict - check if it's in our allowed list
+                        if new_path in ALLOWED_EMPTY_KEYS:
+                            user_specified_keys.add(new_path)
+                    else:
+                        # Recursively check nested dictionaries
+                        user_specified_keys.update(
+                            self._extract_user_specified_empty_keys(value, new_path)
+                        )
+                elif isinstance(value, list):
+                    # Handle lists (though less common for empty key scenarios)
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict):
+                            item_path = f"{new_path}[{i}]"
+                            user_specified_keys.update(
+                                self._extract_user_specified_empty_keys(item, item_path)
+                            )
+        
+        return user_specified_keys
+
     @property
     def metadata(self):
         md = self._values.get('metadata')
@@ -206,25 +248,44 @@ class ModuleParameters(Parameters):
         cached = self._values.get('_normalized_spec')
         if cached is not None:
             return cached
-        normalized = self._prune_none(spec)
+            
+        # Extract user-specified empty keys before pruning
+        user_specified_keys = self._extract_user_specified_empty_keys(spec)
+        normalized = self._prune_none(spec, user_specified_keys)
         self._values['_normalized_spec'] = normalized
         return normalized
 
-    @staticmethod
-    def _prune_none(obj):
+    def _prune_none(self, obj, user_specified_keys=None, current_path=""):
+        if user_specified_keys is None:
+            user_specified_keys = set()
+            
         if isinstance(obj, dict):
             new_obj = {}
             for k, v in obj.items():
                 if v is None:
                     continue
-                pruned = ModuleParameters._prune_none(v)
-                if pruned in (None, {}, []):
+                    
+                new_path = f"{current_path}.{k}" if current_path else k
+                pruned = self._prune_none(v, user_specified_keys, new_path)
+                
+                # Keep empty objects {} only if user explicitly specified them
+                if isinstance(pruned, dict) and len(pruned) == 0:
+                    if new_path in user_specified_keys:
+                        new_obj[k] = pruned
+                    # Otherwise skip the empty dict
+                elif pruned in (None, [], [{}]):
                     continue
-                new_obj[k] = pruned
+                else:
+                    new_obj[k] = pruned
             return new_obj
         if isinstance(obj, list):
-            new_list = [ModuleParameters._prune_none(v) for v in obj]
-            return [v for v in new_list if v not in (None, {}, [])]
+            new_list = []
+            for i, v in enumerate(obj):
+                item_path = f"{current_path}[{i}]" if current_path else f"[{i}]"
+                pruned = self._prune_none(v, user_specified_keys, item_path)
+                if pruned not in (None, {}, [], [{}]):
+                    new_list.append(pruned)
+            return new_list
         return obj
 
 
@@ -244,7 +305,9 @@ class ApiParameters(Parameters):
         if spec is None:
             return spec
         # Apply same pruning as ModuleParameters for consistent comparison
-        return ModuleParameters._prune_none(spec)
+        temp_module = ModuleParameters({'spec': spec})
+        user_specified_keys = temp_module._extract_user_specified_empty_keys(spec)
+        return temp_module._prune_none(spec, user_specified_keys)
 
 
 class Changes(Parameters):
@@ -290,9 +353,13 @@ class Changes(Parameters):
             
             # Normalize both values using the same pruning logic
             if want_value is not None:
-                want_value = ModuleParameters._prune_none(want_value)
+                temp_module = ModuleParameters({'spec': want_value if param == 'spec' else {'metadata': want_value}})
+                user_specified_keys = temp_module._extract_user_specified_empty_keys(want_value)
+                want_value = temp_module._prune_none(want_value, user_specified_keys)
             if have_value is not None:
-                have_value = ModuleParameters._prune_none(have_value)
+                temp_module = ModuleParameters({'spec': have_value if param == 'spec' else {'metadata': have_value}})
+                user_specified_keys = temp_module._extract_user_specified_empty_keys(have_value)
+                have_value = temp_module._prune_none(have_value, user_specified_keys)
             
             if self._values_differ(want_value, have_value):
                 self._changed_params.add(param)
@@ -423,9 +490,13 @@ class ModuleManager(object):
     def _normalize_existing(self, data):
         # Prune None values similar to desired normalization
         normalized = deepcopy(data)
-        normalized['metadata'] = ModuleParameters._prune_none(normalized.get('metadata', {}))
+        # For metadata, use simple none pruning since we don't track user intent on existing data
+        normalized['metadata'] = {k: v for k, v in normalized.get('metadata', {}).items() if v is not None}
         if 'spec' in normalized:
-            normalized['spec'] = ModuleParameters._prune_none(normalized['spec'])
+            # For spec, use simple none pruning since we don't track user intent on existing data
+            temp_module = ModuleParameters({'spec': normalized['spec']})
+            user_specified_keys = set()  # Empty set for existing data
+            normalized['spec'] = temp_module._prune_none(normalized['spec'], user_specified_keys)
         return normalized
 
     def create(self):

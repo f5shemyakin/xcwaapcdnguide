@@ -150,9 +150,11 @@
               refresh_interval: 300
             no_tls: { }
             origin_servers:
-              - public_ip:
-                  ip: "{{ buytime_online }}"
+              - public_name:
+                  dns_name: "waap.{{ domain }}"
                 port: 80
+          default_cache_action:
+            cache_ttl_override: "1d"
           # app_firewall:
           #   tenant: "{{ tenant_settings.tenant.name }}"
           #   namespace: "{{ xc_namespace }}"

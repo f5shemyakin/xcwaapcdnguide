@@ -266,6 +266,46 @@ from ..module_utils.common import (
 )
 from copy import deepcopy
 
+# Define allowed empty keys that have semantic meaning when explicitly set by user
+ALLOWED_EMPTY_KEYS = {
+    # Basic WAF modes (mutually exclusive)
+    'blocking',
+    'monitoring',
+    
+    # Response handling options (mutually exclusive)
+    'allow_all_response_codes',
+    'use_default_blocking_page',
+    
+    # Anonymization options (mutually exclusive)
+    'default_anonymization',
+    'disable_anonymization',
+    
+    # Bot protection options
+    'default_bot_setting',
+    
+    # Detection settings options
+    'default_detection_settings',
+    
+    # Metadata options
+    'metadata.annotations',
+    'metadata.labels',
+    
+    # Detection settings nested options
+    'detection_settings.default_bot_setting',
+    'detection_settings.default_violation_settings',
+    'detection_settings.disable_staging',
+    'detection_settings.disable_suppression',
+    'detection_settings.disable_threat_campaigns',
+    'detection_settings.enable_suppression',
+    'detection_settings.enable_threat_campaigns',
+    
+    # Signature selection settings (mutually exclusive)
+    'detection_settings.signature_selection_setting.default_attack_type_settings',
+    'detection_settings.signature_selection_setting.high_medium_accuracy_signatures',
+    'detection_settings.signature_selection_setting.high_medium_low_accuracy_signatures',
+    'detection_settings.signature_selection_setting.only_high_accuracy_signatures'
+}
+
 
 class Parameters(AnsibleF5Parameters):
     updatables = ['metadata', 'spec']
@@ -288,6 +328,35 @@ class Parameters(AnsibleF5Parameters):
 
 
 class ModuleParameters(Parameters):
+    def _extract_user_specified_empty_keys(self, obj, current_path=""):
+        """Extract paths to empty dicts that user explicitly specified"""
+        user_specified_keys = set()
+        
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_path = f"{current_path}.{key}" if current_path else key
+                
+                if isinstance(value, dict):
+                    if len(value) == 0:
+                        # This is an empty dict - check if it's in our allowed list
+                        if new_path in ALLOWED_EMPTY_KEYS:
+                            user_specified_keys.add(new_path)
+                    else:
+                        # Recursively check nested dictionaries
+                        user_specified_keys.update(
+                            self._extract_user_specified_empty_keys(value, new_path)
+                        )
+                elif isinstance(value, list):
+                    # Handle lists (though less common for empty key scenarios)
+                    for i, item in enumerate(value):
+                        if isinstance(item, dict):
+                            item_path = f"{new_path}[{i}]"
+                            user_specified_keys.update(
+                                self._extract_user_specified_empty_keys(item, item_path)
+                            )
+        
+        return user_specified_keys
+
     @property
     def metadata(self):
         md = self._values.get('metadata')
@@ -315,27 +384,44 @@ class ModuleParameters(Parameters):
         cached = self._values.get('_normalized_spec')
         if cached is not None:
             return cached
-        normalized = self._prune_none(spec)
+        
+        # Extract user-specified empty keys before pruning
+        user_specified_keys = self._extract_user_specified_empty_keys(spec)
+        normalized = self._prune_none(spec, user_specified_keys)
         self._values['_normalized_spec'] = normalized
         return normalized
 
-    @staticmethod
-    def _prune_none(obj):
+    def _prune_none(self, obj, user_specified_keys=None, current_path=""):
+        if user_specified_keys is None:
+            user_specified_keys = set()
+            
         if isinstance(obj, dict):
             new_obj = {}
             for k, v in obj.items():
                 if v is None:
                     continue
-                pruned = ModuleParameters._prune_none(v)
-                # Keep empty objects {} as they are meaningful in F5 XC API
-                # Only skip if the value is explicitly None after pruning
-                if pruned is None:
+                    
+                new_path = f"{current_path}.{k}" if current_path else k
+                pruned = self._prune_none(v, user_specified_keys, new_path)
+                
+                # Keep empty objects {} only if user explicitly specified them
+                if isinstance(pruned, dict) and len(pruned) == 0:
+                    if new_path in user_specified_keys:
+                        new_obj[k] = pruned
+                    # Otherwise skip the empty dict
+                elif pruned is None:
                     continue
-                new_obj[k] = pruned
+                else:
+                    new_obj[k] = pruned
             return new_obj
         if isinstance(obj, list):
-            new_list = [ModuleParameters._prune_none(v) for v in obj]
-            return [v for v in new_list if v is not None]
+            new_list = []
+            for i, v in enumerate(obj):
+                item_path = f"{current_path}[{i}]" if current_path else f"[{i}]"
+                pruned = self._prune_none(v, user_specified_keys, item_path)
+                if pruned is not None:
+                    new_list.append(pruned)
+            return new_list
         return obj
 
 
@@ -364,7 +450,10 @@ class ApiParameters(Parameters):
         if spec is None:
             return spec
         # Apply same pruning as ModuleParameters for consistent comparison
-        return ModuleParameters._prune_none(spec)
+        # For API parameters, we'll preserve all empty dicts since we don't have user context
+        temp_module = ModuleParameters({'spec': spec})
+        user_specified_keys = temp_module._extract_user_specified_empty_keys(spec)
+        return temp_module._prune_none(spec, user_specified_keys)
 
 
 class Changes(Parameters):
@@ -592,7 +681,7 @@ class ModuleManager(object):
             for field in user_fields:
                 if field in metadata and metadata[field] is not None:
                     user_metadata[field] = metadata[field]
-            normalized['metadata'] = ModuleParameters._prune_none(user_metadata)
+            normalized['metadata'] = {k: v for k, v in user_metadata.items() if v is not None}
         
         # Keep spec as-is from API response, only remove system_metadata
         # Don't prune None values from spec as empty objects {} have semantic meaning

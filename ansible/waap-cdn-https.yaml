@@ -160,11 +160,19 @@
             public_name:
               dns_name: "waap.{{ domain }}"
               refresh_interval: 300
-            no_tls: { }
+            use_tls:
+              use_host_header_as_sni: {}
+              tls_config:
+                default_security: {}
+              volterra_trusted_ca: {}
+              no_mtls: {}
+              default_session_key_caching: {}
             origin_servers:
               - public_name:
                   dns_name: "waap.{{ domain }}"
                 port: 443
+          default_cache_action:
+            cache_ttl_override: "1d"
           # app_firewall:
           #   tenant: "{{ tenant_settings.tenant.name }}"
           #   namespace: "{{ xc_namespace }}"
